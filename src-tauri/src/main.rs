@@ -36,15 +36,22 @@ type FolderHandle = isize;
 #[cfg(not(target_os = "windows"))]
 type FolderHandle = usize;
 
+#[derive(Serialize, Deserialize, Clone)]
+struct FolderConfig {
+    path: String,
+    auto_lock: bool,
+}
+
 struct AppState {
+    folders: Mutex<Vec<FolderConfig>>,
     handles: Mutex<HashMap<String, FolderHandle>>,
     startup_failures: Mutex<Vec<String>>,
     is_quitting: AtomicBool,
 }
 
 #[derive(Serialize, Deserialize)]
-struct LockedFoldersFile {
-    folders: Vec<String>,
+struct SettingsFile {
+    folders: Vec<FolderConfig>,
 }
 
 fn data_file_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -53,26 +60,24 @@ fn data_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("failed to resolve app_data_dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| format!("failed to create app_data_dir: {e}"))?;
-    Ok(app_data_dir.join("locked-folders.json"))
+    Ok(app_data_dir.join("settings.json"))
 }
 
-fn save_locked_folders(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let paths = state
-        .handles
+fn save_settings(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let folders = state
+        .folders
         .lock()
         .map_err(|_| "failed to lock state".to_string())?
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+        .clone();
 
-    let content = serde_json::to_string_pretty(&LockedFoldersFile { folders: paths })
-        .map_err(|e| format!("failed to serialize folders: {e}"))?;
+    let content = serde_json::to_string_pretty(&SettingsFile { folders })
+        .map_err(|e| format!("failed to serialize settings: {e}"))?;
     let file_path = data_file_path(app)?;
-    fs::write(file_path, content).map_err(|e| format!("failed to save locked folders: {e}"))?;
+    fs::write(file_path, content).map_err(|e| format!("failed to save settings: {e}"))?;
     Ok(())
 }
 
-fn load_locked_folders(app: &AppHandle) -> Vec<String> {
+fn load_settings(app: &AppHandle) -> Vec<FolderConfig> {
     let file_path = match data_file_path(app) {
         Ok(path) => path,
         Err(_) => return Vec::new(),
@@ -86,7 +91,7 @@ fn load_locked_folders(app: &AppHandle) -> Vec<String> {
         return Vec::new();
     };
 
-    let Ok(parsed) = serde_json::from_str::<LockedFoldersFile>(&content) else {
+    let Ok(parsed) = serde_json::from_str::<SettingsFile>(&content) else {
         return Vec::new();
     };
 
@@ -102,11 +107,14 @@ fn normalize_path(path: &str) -> Result<String, String> {
     if !p.is_dir() {
         return Err("path is not a folder".to_string());
     }
-    fs::canonicalize(p)
-        .map_err(|e| format!("failed to normalize path: {e}"))?
+    let canonical = fs::canonicalize(p)
+        .map_err(|e| format!("failed to normalize path: {e}"))?;
+    let s = canonical
         .to_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "invalid unicode path".to_string())
+        .ok_or_else(|| "invalid unicode path".to_string())?;
+    // Strip Windows extended-length path prefix \\?\ added by canonicalize
+    let clean = s.strip_prefix(r"\\?\").unwrap_or(s);
+    Ok(clean.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -146,42 +154,118 @@ fn lock_folder_inner(path: &str, state: &AppState) -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
+fn add_folder(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let normalized = normalize_path(&path)?;
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    
+    if folders.iter().any(|f| f.path == normalized) {
+        return Err("Folder already in list".to_string());
+    }
+
+    folders.push(FolderConfig {
+        path: normalized.clone(),
+        auto_lock: true,
+    });
+    drop(folders);
+
+    let _ = lock_folder_inner(&normalized, state.inner());
+    save_settings(&app, state.inner())?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn remove_folder(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let _ = unlock_folder_inner(&path, state.inner());
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    folders.retain(|f| f.path != path);
+    drop(folders);
+    save_settings(&app, state.inner())?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn unlock_folder_inner(path: &str, state: &AppState) -> Result<(), String> {
+    let mut handles = state
+        .handles
+        .lock()
+        .map_err(|_| "failed to lock state".to_string())?;
+
+    if let Some(raw) = handles.remove(path) {
+        let closed = unsafe { CloseHandle(HANDLE(raw as *mut core::ffi::c_void)) };
+        if let Err(e) = closed {
+            return Err(format!("failed to close folder handle: {e}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn toggle_folder_lock(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let is_locked = {
+        let handles = state.handles.lock().map_err(|_| "failed to lock state")?;
+        handles.contains_key(&path)
+    };
+
+    if is_locked {
+        unlock_folder_inner(&path, state.inner())?;
+    } else {
+        lock_folder_inner(&path, state.inner())?;
+    }
+
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    if let Some(folder) = folders.iter_mut().find(|f| f.path == path) {
+        folder.auto_lock = !is_locked;
+    }
+    drop(folders);
+
+    save_settings(&app, state.inner())?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
 fn lock_folder(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
     lock_folder_inner(&path, state.inner())?;
-    save_locked_folders(&app, state.inner())?;
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    if let Some(folder) = folders.iter_mut().find(|f| f.path == path) {
+        folder.auto_lock = true;
+    }
+    drop(folders);
+    save_settings(&app, state.inner())?;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn unlock_folder(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let normalized = normalize_path(&path)?;
-    let mut handles = state
-        .handles
-        .lock()
-        .map_err(|_| "failed to lock state".to_string())?;
-
-    let raw = handles
-        .remove(&normalized)
-        .ok_or_else(|| "folder is not currently locked".to_string())?;
-    let closed = unsafe { CloseHandle(HANDLE(raw as *mut core::ffi::c_void)) };
-    if let Err(e) = closed {
-        return Err(format!("failed to close folder handle: {e}"));
+    unlock_folder_inner(&path, state.inner())?;
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    if let Some(folder) = folders.iter_mut().find(|f| f.path == path) {
+        folder.auto_lock = false;
     }
-
-    drop(handles);
-    save_locked_folders(&app, state.inner())?;
+    drop(folders);
+    save_settings(&app, state.inner())?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct FolderStatus {
+    path: String,
+    is_locked: bool,
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-fn get_locked_folders(state: State<AppState>) -> Vec<String> {
-    state
-        .handles
-        .lock()
-        .map(|m| m.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default()
+fn get_folders_with_status(state: State<AppState>) -> Vec<FolderStatus> {
+    let folders = state.folders.lock().unwrap();
+    let handles = state.handles.lock().unwrap();
+    
+    folders.iter().map(|f| FolderStatus {
+        path: f.path.clone(),
+        is_locked: handles.contains_key(&f.path),
+    }).collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -205,7 +289,48 @@ fn unlock_all(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         let _ = unsafe { CloseHandle(HANDLE(raw as *mut core::ffi::c_void)) };
     }
     drop(handles);
-    save_locked_folders(&app, state.inner())?;
+    
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    for folder in folders.iter_mut() {
+        folder.auto_lock = false;
+    }
+    drop(folders);
+
+    save_settings(&app, state.inner())?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn export_settings(path: String, state: State<AppState>) -> Result<(), String> {
+    let folders = state.folders.lock().map_err(|_| "failed to lock state")?.clone();
+    let content = serde_json::to_string_pretty(&SettingsFile { folders })
+        .map_err(|e| format!("failed to serialize settings: {e}"))?;
+    fs::write(path, content).map_err(|e| format!("failed to export settings: {e}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn import_settings(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("failed to read file: {e}"))?;
+    let parsed: SettingsFile = serde_json::from_str(&content).map_err(|e| format!("failed to parse settings: {e}"))?;
+    
+    // Unlock everything first
+    unlock_all(app.clone(), state.clone())?;
+
+    let mut folders = state.folders.lock().map_err(|_| "failed to lock state")?;
+    *folders = parsed.folders.clone();
+    drop(folders);
+
+    // Try to lock folders that should be locked
+    for folder in &parsed.folders {
+        if folder.auto_lock {
+            let _ = lock_folder_inner(&folder.path, state.inner());
+        }
+    }
+
+    save_settings(&app, state.inner())?;
     Ok(())
 }
 
@@ -253,6 +378,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_handle = app.handle().clone();
     TrayIconBuilder::with_id("folder-locker-tray")
+        .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id().as_ref() {
@@ -328,6 +454,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
+            folders: Mutex::new(Vec::new()),
             handles: Mutex::new(HashMap::new()),
             startup_failures: Mutex::new(Vec::new()),
             is_quitting: AtomicBool::new(false),
@@ -349,25 +476,39 @@ fn main() {
                 let app_handle = app.handle().clone();
                 let state = app.state::<AppState>();
                 setup_tray(app)?;
-                for folder in load_locked_folders(&app_handle) {
-                    if let Err(err) = lock_folder_inner(&folder, state.inner()) {
-                        if let Ok(mut failures) = state.startup_failures.lock() {
-                            failures.push(format!("{folder} ({err})"));
+                
+                let settings = load_settings(&app_handle);
+                {
+                    let mut folders = state.folders.lock().unwrap();
+                    *folders = settings.clone();
+                }
+
+                for folder in settings {
+                    if folder.auto_lock {
+                        if let Err(err) = lock_folder_inner(&folder.path, state.inner()) {
+                            if let Ok(mut failures) = state.startup_failures.lock() {
+                                failures.push(format!("{} ({err})", folder.path));
+                            }
                         }
                     }
                 }
-                let _ = save_locked_folders(&app_handle, state.inner());
+                let _ = save_settings(&app_handle, state.inner());
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             lock_folder,
             unlock_folder,
-            get_locked_folders,
+            add_folder,
+            remove_folder,
+            toggle_folder_lock,
+            get_folders_with_status,
             get_relock_failures,
             unlock_all,
             set_autostart,
-            get_autostart_status
+            get_autostart_status,
+            export_settings,
+            import_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
